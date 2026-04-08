@@ -1,6 +1,7 @@
 """CLI entry point for net-sight."""
 
 import sys
+import traceback
 
 from net_sight.pipeline import run
 
@@ -20,8 +21,8 @@ def main():
     except KeyboardInterrupt:
         print("\nAborted.")
         sys.exit(130)
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+    except Exception:
+        traceback.print_exc()
         sys.exit(1)
 
 

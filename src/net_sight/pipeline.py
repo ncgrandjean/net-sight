@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import os
 import time
+import traceback
 
 import cv2
 import numpy as np
@@ -22,14 +24,14 @@ from net_sight.tiling.grid import (
 from net_sight.cv.lines import classify_line_types, detect_lines
 from net_sight.cv.ocr import extract_texts
 from net_sight.cv.shapes import detect_shapes
-from net_sight.cv.colors import analyze_line_colors
+from net_sight.cv.colors import cluster_colors
 from net_sight.analyze.ollama_client import OllamaClient
 from net_sight.analyze.passes import run_all_passes
 from net_sight.merge.consolidate import merge_tile_results
 from net_sight.output.markdown import format_cv_summary, format_report
 
 # ----- Configuration (edit here) -----
-WORKERS = 4
+WORKERS = 1
 MODEL = "qwen3-vl:8b"
 OLLAMA_URL = "http://localhost:11434"
 TIMEOUT = 300
@@ -60,6 +62,8 @@ def run(image_path: str) -> str:
 
     print("[net-sight] Step 1/5: Preprocessing...")
     enhanced = _apply_preprocessing(img, params)
+    del img  # Free original image
+    gc.collect()
 
     # --- Step 2: Tiling ---
     print("[net-sight] Step 2/5: Tiling...")
@@ -71,14 +75,19 @@ def run(image_path: str) -> str:
     adjacent_pairs = get_adjacent_pairs(tiles, rows, cols)
     print(f"[net-sight]   {len(tiles)} tiles, {len(adjacent_pairs)} adjacent pairs")
 
-    # --- Step 3: CV augmentation ---
+    # Extract overlap images before freeing the full enhanced image
+    pair_images = [_extract_overlap_image(enhanced, a, b) for a, b in adjacent_pairs]
+    del enhanced  # Free the large upscaled image (~200 Mo)
+    gc.collect()
+
+    # --- Step 3: CV augmentation (per-tile, not on the huge full image) ---
     print("[net-sight] Step 3/5: Computer vision analysis...")
-    cv_data = _run_cv(enhanced, tiles, adjacent_pairs)
+    cv_data = _run_cv_per_tile(tiles, adjacent_pairs)
 
     # --- Step 4: VLM analysis ---
     print(f"[net-sight] Step 4/5: VLM analysis ({MODEL}, {WORKERS} workers)...")
     vlm_results = asyncio.run(
-        _run_vlm(global_view, tiles, adjacent_pairs, enhanced, cv_data)
+        _run_vlm(global_view, tiles, adjacent_pairs, pair_images, cv_data)
     )
 
     # --- Step 5: Merge and output ---
@@ -193,36 +202,87 @@ def _tile_to_meta(tile: Tile) -> dict:
     }
 
 
-def _run_cv(
-    enhanced: np.ndarray, tiles: list[Tile], adjacent_pairs: list[tuple[Tile, Tile]]
-) -> dict:
-    """Run CV augmentation on the full image and collect stats."""
-    lines = detect_lines(enhanced)
-    line_groups = classify_line_types(lines, enhanced)
-    # Flatten groups back to a single list (lines are enriched in-place with color_rgb/is_dashed)
-    all_lines = [ln for group in line_groups.values() for ln in group]
-    texts = extract_texts(enhanced)
-    shapes = detect_shapes(enhanced)
-    color_info = analyze_line_colors(enhanced, all_lines)
+def _cluster_existing_colors(lines: list[dict]) -> dict:
+    """Cluster line colors using color_rgb already stored in each line dict."""
+    colors = []
+    for ln in lines:
+        c = ln.get("color_rgb") or ln.get("color")
+        if c:
+            colors.append(c)
+    if not colors:
+        return {"clusters": []}
+    clusters = cluster_colors(colors)
+    result = []
+    for label, rgb in clusters.items():
+        count = sum(1 for c in colors if c == rgb)
+        result.append({
+            "color_rgb": rgb,
+            "count": count,
+            "percentage": round(count / len(colors) * 100, 2),
+        })
+    result.sort(key=lambda c: c["count"], reverse=True)
+    return {"clusters": result, "total_lines": len(lines)}
 
-    # Build per-tile CV context strings for VLM prompts
+
+def _run_cv_per_tile(
+    tiles: list[Tile], adjacent_pairs: list[tuple[Tile, Tile]]
+) -> dict:
+    """Run CV augmentation per tile instead of on the full image.
+
+    This avoids loading the full upscaled image into OCR/line detection,
+    saving several GB of RAM.
+    """
+    total_lines = 0
+    total_texts = 0
+    total_shapes = 0
+    all_lines: list[dict] = []
+    all_texts: list[dict] = []
+
     tile_cv_contexts = []
-    for tile in tiles:
+
+    for i, tile in enumerate(tiles):
+        print(f"[net-sight]   CV: tile {i + 1}/{len(tiles)}...")
+
         tile_lines = detect_lines(tile.image, min_length=15)
-        tile_texts_count = len([
-            t for t in texts
-            if tile.x <= t["x"] + t["width"] / 2 <= tile.x + tile.width
-            and tile.y <= t["y"] + t["height"] / 2 <= tile.y + tile.height
-        ])
+        line_groups = classify_line_types(tile_lines, tile.image)
+        enriched = [ln for group in line_groups.values() for ln in group]
+
+        tile_texts = extract_texts(tile.image)
+        tile_shapes = detect_shapes(tile.image)
+
+        # Remap coordinates to global image frame
+        for ln in enriched:
+            ln["x1"] += tile.x
+            ln["y1"] += tile.y
+            ln["x2"] += tile.x
+            ln["y2"] += tile.y
+
+        for t in tile_texts:
+            t["x"] += tile.x
+            t["y"] += tile.y
+
+        all_lines.extend(enriched)
+        all_texts.extend(tile_texts)
+        total_lines += len(enriched)
+        total_texts += len(tile_texts)
+        total_shapes += len(tile_shapes)
+
+        # Build CV context for this tile's VLM prompt
         ctx = (
             f"CV analysis of this zone detected {len(tile_lines)} line segments "
-            f"and approximately {tile_texts_count} text labels. "
+            f"and {len(tile_texts)} text labels. "
         )
         if tile_lines:
             horiz = sum(1 for ln in tile_lines if ln["angle"] < 30)
             orient = "horizontal" if horiz > len(tile_lines) / 2 else "mixed"
             ctx += f"Line orientations: mostly {orient}. "
+        if tile_texts:
+            labels = [t["text"] for t in tile_texts[:10]]
+            ctx += f"Detected labels include: {', '.join(labels)}. "
         tile_cv_contexts.append(ctx)
+
+    # Color clustering from already-extracted line colors (no image needed)
+    color_info = _cluster_existing_colors(all_lines)
 
     # Build cross-tile CV contexts
     pair_cv_contexts = []
@@ -232,13 +292,13 @@ def _run_cv(
         )
 
     return {
-        "lines_count": len(all_lines),
-        "texts_count": len(texts),
-        "shapes_count": len(shapes),
+        "lines_count": total_lines,
+        "texts_count": total_texts,
+        "shapes_count": total_shapes,
         "color_clusters": len(color_info.get("clusters", [])),
         "tile_cv_contexts": tile_cv_contexts,
         "pair_cv_contexts": pair_cv_contexts,
-        "all_texts": texts,
+        "all_texts": all_texts,
         "all_lines": all_lines,
     }
 
@@ -247,7 +307,7 @@ async def _run_vlm(
     global_view: np.ndarray,
     tiles: list[Tile],
     adjacent_pairs: list[tuple[Tile, Tile]],
-    full_img: np.ndarray,
+    pair_images: list[np.ndarray],
     cv_data: dict,
 ) -> dict:
     """Run all VLM passes asynchronously."""
@@ -256,9 +316,8 @@ async def _run_vlm(
     # Convert Tile objects to (meta_dict, image) tuples expected by passes.py
     tile_tuples = [(_tile_to_meta(t), t.image) for t in tiles]
 
-    # Extract overlap images for cross-tile pass
+    # Build pair metadata
     pair_meta = [(_tile_to_meta(a), _tile_to_meta(b)) for a, b in adjacent_pairs]
-    pair_images = [_extract_overlap_image(full_img, a, b) for a, b in adjacent_pairs]
 
     return await run_all_passes(
         client=client,
