@@ -6,19 +6,17 @@ import asyncio
 import gc
 import os
 import time
-import traceback
 
 import cv2
 import numpy as np
 
 from net_sight.preprocess.autotune import analyze_image, compute_params
-from net_sight.preprocess.enhance import enhance_contrast, sharpen, upscale
+from net_sight.preprocess.enhance import enhance_contrast, sharpen
 from net_sight.preprocess.morphology import close_gaps, dilate_lines
 from net_sight.tiling.grid import (
     Tile,
     compute_grid,
     create_global_view,
-    get_adjacent_pairs,
     split_into_tiles,
 )
 from net_sight.cv.lines import classify_line_types, detect_lines
@@ -26,7 +24,8 @@ from net_sight.cv.ocr import extract_texts
 from net_sight.cv.shapes import detect_shapes
 from net_sight.cv.colors import cluster_colors
 from net_sight.analyze.ollama_client import OllamaClient
-from net_sight.analyze.passes import run_all_passes
+from net_sight.analyze.passes import run_global_pass, run_tile_pass
+from net_sight.analyze.prompts import GLOBAL_PROMPT, TILE_PROMPT, format_prompt
 from net_sight.merge.consolidate import merge_tile_results
 from net_sight.output.markdown import format_cv_summary, format_report
 
@@ -35,16 +34,24 @@ WORKERS = 1
 MODEL = "qwen3-vl:8b"
 OLLAMA_URL = "http://localhost:11434"
 TIMEOUT = 3600
+VLM_TILE_SIZE = 1024  # Max tile size sent to VLM
 # --------------------------------------
 
 
-def run(image_path: str) -> str:
+def run(image_path: str, debug: bool = False) -> str:
     """Run the full analysis pipeline on a network diagram image.
 
     Returns the path to the generated markdown report.
     """
     t0 = time.time()
     print(f"[net-sight] Analyzing: {image_path}")
+
+    # Debug output directory
+    debug_dir = None
+    if debug:
+        debug_dir = os.path.join(os.path.dirname(image_path) or ".", "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        print(f"[net-sight] Debug mode: saving intermediates to {debug_dir}/")
 
     # --- Load image ---
     img = cv2.imread(image_path)
@@ -54,46 +61,53 @@ def run(image_path: str) -> str:
     h, w = img.shape[:2]
     print(f"[net-sight] Image size: {w}x{h}")
 
-    # --- Step 1: Auto-tune and preprocess ---
-    print("[net-sight] Step 1/5: Analyzing image characteristics...")
+    if debug:
+        cv2.imwrite(os.path.join(debug_dir, "01_original.png"), img)
+
+    # --- Step 1: Preprocess (no upscale, dilation only) ---
+    print("[net-sight] Step 1/4: Analyzing image characteristics...")
     characteristics = analyze_image(img)
     params = compute_params(characteristics)
-    print(f"[net-sight]   Auto-tuned params: {params}")
+    # Force no upscale: dilation alone handles thin lines
+    params["upscale_factor"] = 1
+    print(f"[net-sight]   Line thickness: {characteristics['mean_line_thickness']:.1f}px")
+    print(f"[net-sight]   Dilation: kernel={params['morph_kernel_size']} iter={params['morph_iterations']}")
 
-    print("[net-sight] Step 1/5: Preprocessing...")
-    enhanced = _apply_preprocessing(img, params)
-    del img  # Free original image
+    print("[net-sight] Step 1/4: Preprocessing...")
+    enhanced = _apply_preprocessing(img, params, debug_dir)
+    del img
     gc.collect()
 
     # --- Step 2: Tiling ---
-    print("[net-sight] Step 2/5: Tiling...")
+    print("[net-sight] Step 2/4: Tiling...")
     eh, ew = enhanced.shape[:2]
     max_tiles = params.get("tile_count", 16)
     rows, cols = compute_grid(eh, ew, target_tile_size=1024, overlap=0.25, max_tiles=max_tiles)
     tiles = split_into_tiles(enhanced, rows, cols, overlap=0.25)
     global_view = create_global_view(enhanced)
-    adjacent_pairs = get_adjacent_pairs(tiles, rows, cols)
-    print(f"[net-sight]   {len(tiles)} tiles, {len(adjacent_pairs)} adjacent pairs")
+    print(f"[net-sight]   {len(tiles)} tiles ({rows}x{cols})")
 
-    # Extract overlap images before freeing the full enhanced image
-    pair_images = [_extract_overlap_image(enhanced, a, b) for a, b in adjacent_pairs]
-    del enhanced  # Free the large upscaled image (~200 Mo)
+    if debug:
+        cv2.imwrite(os.path.join(debug_dir, "05_global_view.png"), global_view)
+        for tile in tiles:
+            name = f"05_tile_{tile.row}_{tile.col}.png"
+            cv2.imwrite(os.path.join(debug_dir, name), tile.image)
+
+    del enhanced
     gc.collect()
 
-    # --- Step 3: CV augmentation (per-tile, not on the huge full image) ---
-    print("[net-sight] Step 3/5: Computer vision analysis...")
-    cv_data = _run_cv_per_tile(tiles, adjacent_pairs)
+    # --- Step 3: CV augmentation (per-tile) ---
+    print("[net-sight] Step 3/4: Computer vision analysis...")
+    cv_data = _run_cv_per_tile(tiles)
 
-    # --- Step 4: VLM analysis ---
-    print(f"[net-sight] Step 4/5: VLM analysis ({MODEL}, {WORKERS} workers)...")
-    vlm_results = asyncio.run(
-        _run_vlm(global_view, tiles, adjacent_pairs, pair_images, cv_data)
-    )
+    # --- Step 4: VLM analysis (global + tiles only, no cross-tile pass) ---
+    print(f"[net-sight] Step 4/4: VLM analysis ({MODEL})...")
+    print(f"[net-sight]   1 global + {len(tiles)} tiles = {1 + len(tiles)} VLM calls")
+    vlm_results = asyncio.run(_run_vlm(global_view, tiles, cv_data))
 
-    # --- Step 5: Merge and output ---
-    print("[net-sight] Step 5/5: Merging results...")
+    # --- Output ---
+    print("[net-sight] Generating report...")
 
-    # Build tile result dicts for merge (add positional info + VLM text)
     tile_result_dicts = []
     for tile, result_text in zip(tiles, vlm_results["tiles"]):
         tile_result_dicts.append({
@@ -107,18 +121,16 @@ def run(image_path: str) -> str:
     merged = merge_tile_results(
         vlm_results["global"],
         tile_result_dicts,
-        vlm_results["cross_tile"],
+        [],  # No cross-tile pass
     )
 
     elapsed = round(time.time() - t0, 1)
     meta = {
         "Source": os.path.basename(image_path),
         "Image size": f"{w}x{h}",
-        "Upscale": f"x{params['upscale_factor']}",
         "Dilation": f"kernel={params['morph_kernel_size']} iter={params['morph_iterations']}",
         "Tiles": f"{len(tiles)} ({rows}x{cols})",
         "Model": MODEL,
-        "Workers": WORKERS,
         "Duration": f"{elapsed}s",
     }
 
@@ -131,7 +143,6 @@ def run(image_path: str) -> str:
 
     report = format_report(image_path, merged, cv_summary, meta)
 
-    # Write output
     output_path = os.path.splitext(image_path)[0] + ".md"
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(report)
@@ -140,54 +151,65 @@ def run(image_path: str) -> str:
     return output_path
 
 
-def _apply_preprocessing(img: np.ndarray, params: dict) -> np.ndarray:
-    """Apply the preprocessing steps using autotune params."""
-    result = upscale(img, params.get("upscale_factor", 1))
+# -----------------------------------------------------------------------
+# Preprocessing
+# -----------------------------------------------------------------------
+
+def _apply_preprocessing(
+    img: np.ndarray, params: dict, debug_dir: str | None = None
+) -> np.ndarray:
+    """Apply preprocessing steps. No upscale, dilation handles thin lines."""
+    result = img.copy()
+    step = 1
 
     if params.get("morph_iterations", 0) > 0:
+        step += 1
         result = dilate_lines(
             result,
             kernel_size=params.get("morph_kernel_size", 3),
             iterations=params["morph_iterations"],
         )
+        if debug_dir:
+            cv2.imwrite(os.path.join(debug_dir, f"0{step}_dilated.png"), result)
 
     if params.get("close_gaps_kernel", 0) > 0:
+        step += 1
         result = close_gaps(result, kernel_size=params["close_gaps_kernel"])
+        if debug_dir:
+            cv2.imwrite(os.path.join(debug_dir, f"0{step}_gaps_closed.png"), result)
 
     if params.get("clahe_enabled", False):
+        step += 1
         result = enhance_contrast(
             result,
             clip_limit=params.get("clahe_clip_limit", 2.0),
             grid_size=params.get("clahe_grid_size", 8),
         )
+        if debug_dir:
+            cv2.imwrite(os.path.join(debug_dir, f"0{step}_clahe.png"), result)
 
     if params.get("sharpen_enabled", True):
+        step += 1
         result = sharpen(result, amount=params.get("sharpen_amount", 1.5))
+        if debug_dir:
+            cv2.imwrite(os.path.join(debug_dir, f"0{step}_sharpened.png"), result)
 
     return result
 
 
-def _extract_overlap_image(
-    full_img: np.ndarray, tile_a: Tile, tile_b: Tile
-) -> np.ndarray:
-    """Crop the overlap region between two adjacent tiles from the full image."""
-    if tile_a.row == tile_b.row:
-        # Horizontal adjacency
-        ox = tile_b.x
-        oy = max(tile_a.y, tile_b.y)
-        ow = (tile_a.x + tile_a.width) - tile_b.x
-        oh = min(tile_a.y + tile_a.height, tile_b.y + tile_b.height) - oy
-    else:
-        # Vertical adjacency
-        ox = max(tile_a.x, tile_b.x)
-        oy = tile_b.y
-        ow = min(tile_a.x + tile_a.width, tile_b.x + tile_b.width) - ox
-        oh = (tile_a.y + tile_a.height) - tile_b.y
+# -----------------------------------------------------------------------
+# Tile resizing for VLM
+# -----------------------------------------------------------------------
 
-    # Clamp to valid bounds
-    ow = max(1, ow)
-    oh = max(1, oh)
-    return full_img[oy : oy + oh, ox : ox + ow].copy()
+def _resize_for_vlm(img: np.ndarray, max_size: int = VLM_TILE_SIZE) -> np.ndarray:
+    """Resize image so longest side is max_size, preserving aspect ratio."""
+    h, w = img.shape[:2]
+    if max(h, w) <= max_size:
+        return img
+    scale = max_size / max(h, w)
+    new_w = round(w * scale)
+    new_h = round(h * scale)
+    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
 def _tile_to_meta(tile: Tile) -> dict:
@@ -201,6 +223,10 @@ def _tile_to_meta(tile: Tile) -> dict:
         "h": tile.height,
     }
 
+
+# -----------------------------------------------------------------------
+# CV augmentation
+# -----------------------------------------------------------------------
 
 def _cluster_existing_colors(lines: list[dict]) -> dict:
     """Cluster line colors using color_rgb already stored in each line dict."""
@@ -224,20 +250,13 @@ def _cluster_existing_colors(lines: list[dict]) -> dict:
     return {"clusters": result, "total_lines": len(lines)}
 
 
-def _run_cv_per_tile(
-    tiles: list[Tile], adjacent_pairs: list[tuple[Tile, Tile]]
-) -> dict:
-    """Run CV augmentation per tile instead of on the full image.
-
-    This avoids loading the full upscaled image into OCR/line detection,
-    saving several GB of RAM.
-    """
+def _run_cv_per_tile(tiles: list[Tile]) -> dict:
+    """Run CV augmentation per tile."""
     total_lines = 0
     total_texts = 0
     total_shapes = 0
     all_lines: list[dict] = []
     all_texts: list[dict] = []
-
     tile_cv_contexts = []
 
     for i, tile in enumerate(tiles):
@@ -269,7 +288,7 @@ def _run_cv_per_tile(
 
         # Build CV context for this tile's VLM prompt
         ctx = (
-            f"CV analysis of this zone detected {len(tile_lines)} line segments "
+            f"CV analysis detected {len(tile_lines)} line segments "
             f"and {len(tile_texts)} text labels. "
         )
         if tile_lines:
@@ -278,18 +297,10 @@ def _run_cv_per_tile(
             ctx += f"Line orientations: mostly {orient}. "
         if tile_texts:
             labels = [t["text"] for t in tile_texts[:10]]
-            ctx += f"Detected labels include: {', '.join(labels)}. "
+            ctx += f"Detected labels: {', '.join(labels)}. "
         tile_cv_contexts.append(ctx)
 
-    # Color clustering from already-extracted line colors (no image needed)
     color_info = _cluster_existing_colors(all_lines)
-
-    # Build cross-tile CV contexts
-    pair_cv_contexts = []
-    for _ in adjacent_pairs:
-        pair_cv_contexts.append(
-            "Focus on connections crossing the boundary between these adjacent zones."
-        )
 
     return {
         "lines_count": total_lines,
@@ -297,35 +308,46 @@ def _run_cv_per_tile(
         "shapes_count": total_shapes,
         "color_clusters": len(color_info.get("clusters", [])),
         "tile_cv_contexts": tile_cv_contexts,
-        "pair_cv_contexts": pair_cv_contexts,
         "all_texts": all_texts,
         "all_lines": all_lines,
     }
 
 
+# -----------------------------------------------------------------------
+# VLM analysis
+# -----------------------------------------------------------------------
+
 async def _run_vlm(
     global_view: np.ndarray,
     tiles: list[Tile],
-    adjacent_pairs: list[tuple[Tile, Tile]],
-    pair_images: list[np.ndarray],
     cv_data: dict,
 ) -> dict:
-    """Run all VLM passes asynchronously."""
+    """Run global + tile VLM passes (no cross-tile pass)."""
     client = OllamaClient(model=MODEL, base_url=OLLAMA_URL, timeout=TIMEOUT)
 
-    # Convert Tile objects to (meta_dict, image) tuples expected by passes.py
-    tile_tuples = [(_tile_to_meta(t), t.image) for t in tiles]
+    # Pass A: global overview
+    print("[net-sight]   VLM: global overview...")
+    t = time.time()
+    global_result = await run_global_pass(client, global_view)
+    print(f"[net-sight]   VLM: global done ({time.time() - t:.0f}s)")
 
-    # Build pair metadata
-    pair_meta = [(_tile_to_meta(a), _tile_to_meta(b)) for a, b in adjacent_pairs]
+    # Pass B: per-tile detail (sequential with progress)
+    tile_results = []
+    for i, tile in enumerate(tiles):
+        print(f"[net-sight]   VLM: tile {i + 1}/{len(tiles)}...")
+        t = time.time()
 
-    return await run_all_passes(
-        client=client,
-        global_view=global_view,
-        tiles=tile_tuples,
-        adjacent_pairs=pair_meta,
-        pair_images=pair_images,
-        cv_contexts_tiles=cv_data["tile_cv_contexts"],
-        cv_contexts_pairs=cv_data.get("pair_cv_contexts", []),
-        workers=WORKERS,
-    )
+        # Resize tile for VLM (keep original for CV which already ran)
+        vlm_img = _resize_for_vlm(tile.image)
+        cv_ctx = cv_data["tile_cv_contexts"][i] if i < len(cv_data["tile_cv_contexts"]) else ""
+        prompt = format_prompt(TILE_PROMPT, cv_context=cv_ctx)
+
+        result = await client.analyze_image(vlm_img, prompt)
+        tile_results.append(result)
+        print(f"[net-sight]   VLM: tile {i + 1}/{len(tiles)} done ({time.time() - t:.0f}s)")
+
+    return {
+        "global": global_result,
+        "tiles": tile_results,
+        "cross_tile": [],
+    }

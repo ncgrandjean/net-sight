@@ -7,13 +7,18 @@ from net_sight.pipeline import run
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: net-sight <image.png>")
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = [a for a in sys.argv[1:] if a.startswith("--")]
+
+    if len(args) != 1:
+        print("Usage: net-sight <image.png> [--debug]")
         sys.exit(1)
 
-    image_path = sys.argv[1]
+    image_path = args[0]
+    debug = "--debug" in flags
+
     try:
-        output = run(image_path)
+        output = run(image_path, debug=debug)
         print(f"\nReport written to: {output}")
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
