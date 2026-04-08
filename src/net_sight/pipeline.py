@@ -34,7 +34,7 @@ from net_sight.output.markdown import format_cv_summary, format_report
 WORKERS = 1
 MODEL = "qwen3-vl:8b"
 OLLAMA_URL = "http://localhost:11434"
-TIMEOUT = 300
+TIMEOUT = 3600
 # --------------------------------------
 
 
