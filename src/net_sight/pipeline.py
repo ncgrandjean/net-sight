@@ -106,7 +106,7 @@ def run(image_path: str, debug: bool = False, from_tile: int = 0) -> str:
         cv2.imwrite(os.path.join(debug_dir, "05_global_view.png"), global_view)
         for tile in tiles:
             name = f"05_tile_{tile.row}_{tile.col}.png"
-            cv2.imwrite(os.path.join(debug_dir, name), tile.image)
+            cv2.imwrite(os.path.join(debug_dir, name), _resize_for_vlm(tile.image))
 
     del enhanced
     gc.collect()
