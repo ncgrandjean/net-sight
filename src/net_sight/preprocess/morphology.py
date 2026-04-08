@@ -30,19 +30,17 @@ def dilate_lines(img, kernel_size=3, iterations=1):
     if iterations <= 0:
         return img
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    dilated = cv2.dilate(binary, kernel, iterations=iterations)
 
     if img.ndim == 3:
-        # Only darken the *newly added* pixels so the original colours are kept.
-        mask = (dilated > 0) & (binary == 0)
-        result = img.copy()
-        result[mask] = 0
-        return result
+        # Erode the colour image directly: cv2.erode takes the per-channel
+        # minimum over the neighbourhood, which spreads dark (line) pixels
+        # into the bright (background) while preserving original colours.
+        return cv2.erode(img, kernel, iterations=iterations)
 
+    gray = img
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    dilated = cv2.dilate(binary, kernel, iterations=iterations)
     return cv2.bitwise_not(dilated)
 
 
@@ -64,17 +62,18 @@ def close_gaps(img, kernel_size=3):
     np.ndarray
         Image with gaps closed.
     """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
     if img.ndim == 3:
-        # Paint newly-connected pixels black on the colour image.
-        new_pixels = (closed > 0) & (binary == 0)
-        result = img.copy()
-        result[new_pixels] = 0
-        return result
+        # Lines are dark foreground on a bright background.  To close gaps
+        # we erode first (spreads dark lines, bridging gaps) then dilate
+        # (shrinks them back to roughly original thickness).  This is the
+        # inverse of standard morphological closing because the objects of
+        # interest are dark, not bright.
+        eroded = cv2.erode(img, kernel)
+        return cv2.dilate(eroded, kernel)
 
+    gray = img
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
     return cv2.bitwise_not(closed)

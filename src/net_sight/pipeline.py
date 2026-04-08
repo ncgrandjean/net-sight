@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import json
 import os
+import sys
 import time
 
 import cv2
@@ -24,7 +26,6 @@ from net_sight.cv.ocr import extract_texts
 from net_sight.cv.shapes import detect_shapes
 from net_sight.cv.colors import cluster_colors
 from net_sight.analyze.ollama_client import OllamaClient
-from net_sight.analyze.passes import run_global_pass, run_tile_pass
 from net_sight.analyze.prompts import GLOBAL_PROMPT, TILE_PROMPT, format_prompt
 from net_sight.merge.consolidate import merge_tile_results
 from net_sight.output.markdown import format_cv_summary, format_report
@@ -34,17 +35,32 @@ WORKERS = 1
 MODEL = "qwen3-vl:8b"
 OLLAMA_URL = "http://localhost:11434"
 TIMEOUT = 3600
-VLM_TILE_SIZE = 1024  # Max tile size sent to VLM
+VLM_TILE_SIZE = 1024
 # --------------------------------------
 
+# ANSI codes for streaming display
+DIM = "\033[2m"
+RESET = "\033[0m"
 
-def run(image_path: str, debug: bool = False) -> str:
+
+def run(image_path: str, debug: bool = False, from_tile: int = 0) -> str:
     """Run the full analysis pipeline on a network diagram image.
+
+    Parameters
+    ----------
+    image_path : str
+        Path to the input PNG image.
+    debug : bool
+        Save intermediate images to a debug/ folder.
+    from_tile : int
+        1-based tile index to resume from (0 = start from beginning).
 
     Returns the path to the generated markdown report.
     """
     t0 = time.time()
     print(f"[net-sight] Analyzing: {image_path}")
+
+    progress_path = os.path.splitext(image_path)[0] + ".progress.json"
 
     # Debug output directory
     debug_dir = None
@@ -68,8 +84,7 @@ def run(image_path: str, debug: bool = False) -> str:
     print("[net-sight] Step 1/4: Analyzing image characteristics...")
     characteristics = analyze_image(img)
     params = compute_params(characteristics)
-    # Force no upscale: dilation alone handles thin lines
-    params["upscale_factor"] = 1
+    params["upscale_factor"] = 1  # No upscale, dilation handles thin lines
     print(f"[net-sight]   Line thickness: {characteristics['mean_line_thickness']:.1f}px")
     print(f"[net-sight]   Dilation: kernel={params['morph_kernel_size']} iter={params['morph_iterations']}")
 
@@ -100,10 +115,20 @@ def run(image_path: str, debug: bool = False) -> str:
     print("[net-sight] Step 3/4: Computer vision analysis...")
     cv_data = _run_cv_per_tile(tiles)
 
-    # --- Step 4: VLM analysis (global + tiles only, no cross-tile pass) ---
-    print(f"[net-sight] Step 4/4: VLM analysis ({MODEL})...")
+    # --- Step 4: VLM analysis with progress and confirmation ---
+    print(f"[net-sight] Step 4/4: VLM analysis ({MODEL})")
     print(f"[net-sight]   1 global + {len(tiles)} tiles = {1 + len(tiles)} VLM calls")
-    vlm_results = asyncio.run(_run_vlm(global_view, tiles, cv_data))
+
+    # Load existing progress if resuming
+    progress = _load_progress(progress_path, from_tile)
+
+    vlm_results = asyncio.run(
+        _run_vlm_interactive(global_view, tiles, cv_data, progress, progress_path, from_tile)
+    )
+
+    # Clean up progress file on completion
+    if os.path.exists(progress_path):
+        os.remove(progress_path)
 
     # --- Output ---
     print("[net-sight] Generating report...")
@@ -121,7 +146,7 @@ def run(image_path: str, debug: bool = False) -> str:
     merged = merge_tile_results(
         vlm_results["global"],
         tile_result_dicts,
-        [],  # No cross-tile pass
+        [],
     )
 
     elapsed = round(time.time() - t0, 1)
@@ -149,6 +174,34 @@ def run(image_path: str, debug: bool = False) -> str:
 
     print(f"[net-sight] Done in {elapsed}s -> {output_path}")
     return output_path
+
+
+# -----------------------------------------------------------------------
+# Progress management
+# -----------------------------------------------------------------------
+
+def _load_progress(progress_path: str, from_tile: int) -> dict:
+    """Load progress file if it exists, or return empty progress."""
+    if os.path.exists(progress_path):
+        with open(progress_path, encoding="utf-8") as f:
+            progress = json.load(f)
+        done = len(progress.get("tiles", {}))
+        total = progress.get("total_tiles", "?")
+        if from_tile > 0:
+            print(f"[net-sight]   Resuming from tile {from_tile} (--from)")
+        else:
+            print(f"[net-sight]   Found progress: {done}/{total} tiles done.")
+            answer = input("[net-sight]   Resume? [Y/n] ").strip().lower()
+            if answer in ("n", "no"):
+                return {"global_result": None, "tiles": {}, "total_tiles": 0}
+        return progress
+    return {"global_result": None, "tiles": {}, "total_tiles": 0}
+
+
+def _save_progress(progress_path: str, progress: dict):
+    """Save current progress to disk."""
+    with open(progress_path, "w", encoding="utf-8") as f:
+        json.dump(progress, f, ensure_ascii=False, indent=2)
 
 
 # -----------------------------------------------------------------------
@@ -269,7 +322,6 @@ def _run_cv_per_tile(tiles: list[Tile]) -> dict:
         tile_texts = extract_texts(tile.image)
         tile_shapes = detect_shapes(tile.image)
 
-        # Remap coordinates to global image frame
         for ln in enriched:
             ln["x1"] += tile.x
             ln["y1"] += tile.y
@@ -286,7 +338,6 @@ def _run_cv_per_tile(tiles: list[Tile]) -> dict:
         total_texts += len(tile_texts)
         total_shapes += len(tile_shapes)
 
-        # Build CV context for this tile's VLM prompt
         ctx = (
             f"CV analysis detected {len(tile_lines)} line segments "
             f"and {len(tile_texts)} text labels. "
@@ -314,37 +365,108 @@ def _run_cv_per_tile(tiles: list[Tile]) -> dict:
 
 
 # -----------------------------------------------------------------------
-# VLM analysis
+# Streaming display callback
 # -----------------------------------------------------------------------
 
-async def _run_vlm(
+def _stream_callback(fragment: str, is_thinking: bool):
+    """Print VLM tokens in real-time. Thinking in dim, response in normal."""
+    if is_thinking:
+        sys.stdout.write(f"{DIM}{fragment}{RESET}")
+    else:
+        sys.stdout.write(fragment)
+    sys.stdout.flush()
+
+
+# -----------------------------------------------------------------------
+# VLM analysis with interactive confirmation and progress
+# -----------------------------------------------------------------------
+
+async def _run_vlm_interactive(
     global_view: np.ndarray,
     tiles: list[Tile],
     cv_data: dict,
+    progress: dict,
+    progress_path: str,
+    from_tile: int,
 ) -> dict:
-    """Run global + tile VLM passes (no cross-tile pass)."""
+    """Run VLM passes with streaming, confirmation, and progress saving."""
     client = OllamaClient(model=MODEL, base_url=OLLAMA_URL, timeout=TIMEOUT)
 
-    # Pass A: global overview
-    print("[net-sight]   VLM: global overview...")
-    t = time.time()
-    global_result = await run_global_pass(client, global_view)
-    print(f"[net-sight]   VLM: global done ({time.time() - t:.0f}s)")
-
-    # Pass B: per-tile detail (sequential with progress)
-    tile_results = []
-    for i, tile in enumerate(tiles):
-        print(f"[net-sight]   VLM: tile {i + 1}/{len(tiles)}...")
+    # --- Pass A: global overview ---
+    if progress.get("global_result"):
+        print("[net-sight]   VLM: global overview (cached)")
+        global_result = progress["global_result"]
+    else:
+        print("[net-sight]   VLM: global overview...")
         t = time.time()
+        global_result = await client.analyze_image_stream(
+            global_view, GLOBAL_PROMPT, stream_callback=_stream_callback
+        )
+        print()  # newline after streaming
+        print(f"[net-sight]   VLM: global done ({time.time() - t:.0f}s)")
 
-        # Resize tile for VLM (keep original for CV which already ran)
+        progress["global_result"] = global_result
+        progress["total_tiles"] = len(tiles)
+        _save_progress(progress_path, progress)
+
+    # --- Pass B: per-tile detail ---
+    tile_results = list(progress.get("tiles", {}).values())
+    # Pad with empty strings if needed
+    while len(tile_results) < len(tiles):
+        tile_results.append("")
+
+    # Restore already-done tiles from progress
+    cached_tiles = progress.get("tiles", {})
+
+    for i, tile in enumerate(tiles):
+        tile_key = str(i)
+
+        # Skip if already done and not explicitly re-requesting
+        if tile_key in cached_tiles and (from_tile == 0 or (i + 1) < from_tile):
+            print(f"[net-sight]   VLM: tile {i + 1}/{len(tiles)} (cached)")
+            tile_results[i] = cached_tiles[tile_key]
+            continue
+
+        # Skip if --from is set and we haven't reached that tile yet
+        if from_tile > 0 and (i + 1) < from_tile:
+            if tile_key in cached_tiles:
+                tile_results[i] = cached_tiles[tile_key]
+            print(f"[net-sight]   VLM: tile {i + 1}/{len(tiles)} (skipped)")
+            continue
+
+        # Interactive confirmation
+        print(f"\n[net-sight]   Tile {i + 1}/{len(tiles)} "
+              f"(row={tile.row}, col={tile.col}, {tile.width}x{tile.height}px)")
+        try:
+            answer = input("[net-sight]   Press Enter to analyze, 's' to skip, 'q' to quit: ").strip().lower()
+        except EOFError:
+            answer = ""
+
+        if answer == "q":
+            print("[net-sight]   Saving progress and quitting...")
+            _save_progress(progress_path, progress)
+            # Fill remaining tiles with empty strings
+            break
+        if answer == "s":
+            print(f"[net-sight]   Tile {i + 1} skipped.")
+            continue
+
+        # Analyze tile
+        t = time.time()
         vlm_img = _resize_for_vlm(tile.image)
         cv_ctx = cv_data["tile_cv_contexts"][i] if i < len(cv_data["tile_cv_contexts"]) else ""
         prompt = format_prompt(TILE_PROMPT, cv_context=cv_ctx)
 
-        result = await client.analyze_image(vlm_img, prompt)
-        tile_results.append(result)
-        print(f"[net-sight]   VLM: tile {i + 1}/{len(tiles)} done ({time.time() - t:.0f}s)")
+        print(f"[net-sight]   VLM: analyzing tile {i + 1}...")
+        result = await client.analyze_image_stream(
+            vlm_img, prompt, stream_callback=_stream_callback
+        )
+        print()  # newline after streaming
+        print(f"[net-sight]   VLM: tile {i + 1} done ({time.time() - t:.0f}s)")
+
+        tile_results[i] = result
+        progress.setdefault("tiles", {})[tile_key] = result
+        _save_progress(progress_path, progress)
 
     return {
         "global": global_result,

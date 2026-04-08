@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+from collections.abc import Callable
 
 import cv2
 import numpy as np
@@ -15,8 +17,8 @@ logger = logging.getLogger(__name__)
 class OllamaClient:
     """Thin async wrapper around the Ollama chat API for vision-language models.
 
-    Handles image encoding (np.ndarray -> PNG bytes) and concurrency control
-    via a semaphore when processing batches.
+    Handles image encoding (np.ndarray -> PNG bytes) and supports streaming
+    responses with thinking-token awareness for reasoning models.
     """
 
     def __init__(
@@ -49,6 +51,9 @@ class OllamaClient:
     async def analyze_image(self, image: np.ndarray, prompt: str) -> str:
         """Send a single image with a text prompt to the VLM and return the response.
 
+        Convenience wrapper around :meth:`analyze_image_stream` without a
+        streaming callback, kept for backward compatibility.
+
         Parameters
         ----------
         image:
@@ -59,7 +64,45 @@ class OllamaClient:
         Returns
         -------
         str
-            The model's text response.
+            The model's text response (thinking tokens stripped).
+
+        Raises
+        ------
+        ConnectionError
+            When the Ollama server is unreachable.
+        TimeoutError
+            When the request exceeds the configured timeout.
+        RuntimeError
+            On any other Ollama API error.
+        """
+        return await self.analyze_image_stream(image, prompt)
+
+    async def analyze_image_stream(
+        self,
+        image: np.ndarray,
+        prompt: str,
+        stream_callback: Callable[[str, bool], None] | None = None,
+    ) -> str:
+        """Send a single image with a text prompt and stream the response.
+
+        When *stream_callback* is provided it is called for every received
+        token fragment as ``stream_callback(fragment, is_thinking)`` where
+        *is_thinking* is ``True`` while the model emits its internal
+        reasoning between ``<think>`` and ``</think>`` tags.
+
+        Parameters
+        ----------
+        image:
+            BGR numpy array (as returned by ``cv2.imread``).
+        prompt:
+            Textual instruction sent alongside the image.
+        stream_callback:
+            Optional synchronous callback invoked with each text fragment.
+
+        Returns
+        -------
+        str
+            The model's final text response with thinking blocks removed.
 
         Raises
         ------
@@ -73,7 +116,7 @@ class OllamaClient:
         png_bytes = self._encode_image(image)
 
         try:
-            response = await self._client.chat(
+            stream = await self._client.chat(
                 model=self.model,
                 messages=[
                     {
@@ -82,7 +125,53 @@ class OllamaClient:
                         "images": [png_bytes],
                     },
                 ],
+                stream=True,
             )
+
+            full_text: list[str] = []
+            is_thinking = False
+
+            async for chunk in stream:
+                fragment: str = chunk.message.content or ""
+                if not fragment:
+                    continue
+
+                # Track <think> / </think> boundaries across fragments.
+                # A single fragment may contain an opening or closing tag,
+                # or even both, so we process the text incrementally.
+                remaining = fragment
+                while remaining:
+                    if is_thinking:
+                        # Look for the closing tag
+                        close_idx = remaining.find("</think>")
+                        if close_idx != -1:
+                            thinking_part = remaining[:close_idx]
+                            if thinking_part and stream_callback is not None:
+                                stream_callback(thinking_part, True)
+                            full_text.append(remaining[: close_idx + len("</think>")])
+                            remaining = remaining[close_idx + len("</think>"):]
+                            is_thinking = False
+                        else:
+                            if stream_callback is not None:
+                                stream_callback(remaining, True)
+                            full_text.append(remaining)
+                            remaining = ""
+                    else:
+                        # Look for an opening tag
+                        open_idx = remaining.find("<think>")
+                        if open_idx != -1:
+                            before = remaining[:open_idx]
+                            if before and stream_callback is not None:
+                                stream_callback(before, False)
+                            full_text.append(remaining[: open_idx + len("<think>")])
+                            remaining = remaining[open_idx + len("<think>"):]
+                            is_thinking = True
+                        else:
+                            if stream_callback is not None:
+                                stream_callback(remaining, False)
+                            full_text.append(remaining)
+                            remaining = ""
+
         except RequestError as exc:
             raise ConnectionError(
                 f"Cannot reach Ollama at {self.base_url}: {exc}"
@@ -98,39 +187,6 @@ class OllamaClient:
                 f"Ollama request timed out after {self.timeout}s"
             ) from exc
 
-        return response.message.content or ""
-
-    async def analyze_image_batch(
-        self,
-        tasks: list[tuple[np.ndarray, str]],
-        workers: int = 4,
-    ) -> list[str]:
-        """Process multiple (image, prompt) pairs with bounded concurrency.
-
-        Parameters
-        ----------
-        tasks:
-            List of ``(image, prompt)`` tuples to process.
-        workers:
-            Maximum number of concurrent Ollama requests.
-
-        Returns
-        -------
-        list[str]
-            Responses in the same order as *tasks*.
-        """
-        semaphore = asyncio.Semaphore(workers)
-
-        async def _run(idx: int, image: np.ndarray, prompt: str) -> tuple[int, str]:
-            async with semaphore:
-                result = await self.analyze_image(image, prompt)
-                return idx, result
-
-        coros = [_run(i, img, prompt) for i, (img, prompt) in enumerate(tasks)]
-        results = await asyncio.gather(*coros)
-
-        # Re-order by original index
-        ordered = [""] * len(tasks)
-        for idx, text in results:
-            ordered[idx] = text
-        return ordered
+        # Strip all <think>...</think> blocks from the accumulated text.
+        raw = "".join(full_text)
+        return re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
