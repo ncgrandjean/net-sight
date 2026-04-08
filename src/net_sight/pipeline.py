@@ -198,10 +198,12 @@ def _run_cv(
 ) -> dict:
     """Run CV augmentation on the full image and collect stats."""
     lines = detect_lines(enhanced)
-    lines = classify_line_types(lines, enhanced)
+    line_groups = classify_line_types(lines, enhanced)
+    # Flatten groups back to a single list (lines are enriched in-place with color_rgb/is_dashed)
+    all_lines = [ln for group in line_groups.values() for ln in group]
     texts = extract_texts(enhanced)
     shapes = detect_shapes(enhanced)
-    color_info = analyze_line_colors(enhanced, lines)
+    color_info = analyze_line_colors(enhanced, all_lines)
 
     # Build per-tile CV context strings for VLM prompts
     tile_cv_contexts = []
@@ -230,14 +232,14 @@ def _run_cv(
         )
 
     return {
-        "lines_count": len(lines),
+        "lines_count": len(all_lines),
         "texts_count": len(texts),
         "shapes_count": len(shapes),
         "color_clusters": len(color_info.get("clusters", [])),
         "tile_cv_contexts": tile_cv_contexts,
         "pair_cv_contexts": pair_cv_contexts,
         "all_texts": texts,
-        "all_lines": lines,
+        "all_lines": all_lines,
     }
 
 
