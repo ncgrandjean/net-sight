@@ -211,8 +211,8 @@ def _run_cv(
         tile_lines = detect_lines(tile.image, min_length=15)
         tile_texts_count = len([
             t for t in texts
-            if tile.x <= (t["bbox"][0] + t["bbox"][2]) / 2 <= tile.x + tile.width
-            and tile.y <= (t["bbox"][1] + t["bbox"][3]) / 2 <= tile.y + tile.height
+            if tile.x <= t["x"] + t["width"] / 2 <= tile.x + tile.width
+            and tile.y <= t["y"] + t["height"] / 2 <= tile.y + tile.height
         ])
         ctx = (
             f"CV analysis of this zone detected {len(tile_lines)} line segments "
