@@ -1,0 +1,38 @@
+# net-sight default configuration
+# These values are used as fallback when autotuning is not applicable
+
+preprocess:
+  # Upscale factor is auto-calculated based on line thickness
+  # Override: 1 (no upscale), 2, or 4
+  upscale_factor: auto
+  morphology:
+    enabled: true
+    # Kernel size and iterations are auto-calculated
+    kernel_size: auto
+    iterations: auto
+  contrast:
+    enabled: true
+    method: clahe
+    clip_limit: 2.0
+    grid_size: 8
+  sharpen:
+    enabled: true
+    amount: 1.5
+
+tiling:
+  target_size: 1024
+  overlap: 0.25
+  # Number of tiles is auto-calculated based on image density
+  min_tiles: 4
+  max_tiles: 16
+
+analyze:
+  model: qwen3-vl:8b
+  ollama_url: http://localhost:11434
+  timeout: 300
+
+cv_augmentation:
+  lines: true
+  ocr: true
+  shapes: true
+  colors: true
