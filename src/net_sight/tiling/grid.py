@@ -50,11 +50,13 @@ def compute_grid(
     img_width: int,
     target_tile_size: int = 1024,
     overlap: float = 0.25,
+    max_tiles: int = 16,
 ) -> tuple[int, int]:
     """Compute the optimal number of grid rows and columns.
 
     The grid is sized so that each tile is close to *target_tile_size* pixels on
     each side, with an *overlap* fraction shared between adjacent tiles.
+    The total number of tiles (rows * cols) is capped at *max_tiles*.
 
     Returns:
         (rows, cols) tuple.
@@ -64,6 +66,26 @@ def compute_grid(
 
     cols = max(1, math.ceil((img_width - overlap_px) / stride))
     rows = max(1, math.ceil((img_height - overlap_px) / stride))
+
+    # Cap total tile count while preserving aspect ratio of the grid
+    if rows * cols > max_tiles:
+        ratio = cols / rows if rows > 0 else 1.0
+        rows = max(1, round(math.sqrt(max_tiles / ratio)))
+        cols = max(1, round(rows * ratio))
+        # Shrink if over
+        while rows * cols > max_tiles:
+            if rows >= cols:
+                rows -= 1
+            else:
+                cols -= 1
+            rows = max(1, rows)
+            cols = max(1, cols)
+        # Try to grow if under (fill the budget)
+        while (rows + 1) * cols <= max_tiles:
+            rows += 1
+        while rows * (cols + 1) <= max_tiles:
+            cols += 1
+
     return rows, cols
 
 

@@ -64,7 +64,8 @@ def run(image_path: str) -> str:
     # --- Step 2: Tiling ---
     print("[net-sight] Step 2/5: Tiling...")
     eh, ew = enhanced.shape[:2]
-    rows, cols = compute_grid(eh, ew, target_tile_size=1024, overlap=0.25)
+    max_tiles = params.get("tile_count", 16)
+    rows, cols = compute_grid(eh, ew, target_tile_size=1024, overlap=0.25, max_tiles=max_tiles)
     tiles = split_into_tiles(enhanced, rows, cols, overlap=0.25)
     global_view = create_global_view(enhanced)
     adjacent_pairs = get_adjacent_pairs(tiles, rows, cols)
@@ -197,7 +198,7 @@ def _run_cv(
 ) -> dict:
     """Run CV augmentation on the full image and collect stats."""
     lines = detect_lines(enhanced)
-    lines = classify_line_types(enhanced, lines)
+    lines = classify_line_types(lines, enhanced)
     texts = extract_texts(enhanced)
     shapes = detect_shapes(enhanced)
     color_info = analyze_line_colors(enhanced, lines)
